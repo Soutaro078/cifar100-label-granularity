@@ -1,0 +1,13 @@
+# CIFAR-100 事前学習。動作確認用の 5 エポックはここを 200 に戻してある。
+mode: fine
+epochs: 200
+batch_size: 128
+lr: 0.1
+momentum: 0.9
+weight_decay: 0.0005
+# 0 ならメインプロセスだけで読む。ワーカーを使うとこのマシンではプロセス異常やフリーズが起きた。
+num_workers: 0
+scheduler: cosine
+eta_min: 0.0
+wandb: true
+wandb_project: cifar100-label-granularity

@@ -1,0 +1,13 @@
+# 少数サンプルでのファインチューニング。事前学習の 200 エポックとは別設定。
+init_mode: fine
+target_group: trees
+samples_per_class: 10
+epochs: 10
+batch_size: 16
+test_batch_size: 64
+lr: 0.01
+momentum: 0.9
+weight_decay: 0.0005
+seed: 42
+wandb: true
+wandb_project: cifar100-label-granularity

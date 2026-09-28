@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+data/cifar-100-python/
+data/*.tar.gz
+
+outputs/models/*.pth
+outputs/models/*.pt
+outputs/figures/*.png
+
+wandb/

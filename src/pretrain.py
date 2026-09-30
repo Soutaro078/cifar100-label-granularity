@@ -87,6 +87,7 @@ def build_loader(dataset, batch_size, shuffle, num_workers):
         "batch_size": batch_size,
         "shuffle": shuffle,
         "num_workers": num_workers,
+        "pin_memory": False,
     }
     if num_workers > 0:
         loader_kwargs["multiprocessing_context"] = "spawn"
@@ -133,7 +134,7 @@ def load_progress(mode, model, optimizer, scheduler, device):
     return int(checkpoint["epoch"])
 
 
-def evaluate(model, loader, criterion, device, track_derived_coarse, table, groups):
+def evaluate(model, loader, criterion, device, track_derived_coarse, table, group_index):
     model.eval()
     meters = GranularityMeters(track_derived_coarse)
     with torch.no_grad():
@@ -141,7 +142,7 @@ def evaluate(model, loader, criterion, device, track_derived_coarse, table, grou
             images = images.to(device)
             labels = labels.to(device)
             outputs = model(images)
-            meters.update(outputs, labels, criterion, table, groups)
+            meters.update(outputs, labels, criterion, table, group_index)
     return meters.summarize()
 
 
@@ -213,7 +214,7 @@ def main():
     model = build_cifar_resnet18(num_classes)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
-    table, groups = move_fine_to_coarse(table, groups, device)
+    table, group_index = move_fine_to_coarse(table, groups, device)
     print(f"使用デバイス: {device}")
     print("stem: conv1 kernel=3 stride=1 padding=1, maxpool=Identity (32×32 用)")
 
@@ -284,7 +285,7 @@ def main():
                 optimizer.step()
 
                 with torch.no_grad():
-                    train_meters.update(outputs, labels, criterion, table, groups)
+                    train_meters.update(outputs, labels, criterion, table, group_index)
 
                 if batch_idx % 50 == 0:
                     write_status(mode, f"epoch {epoch}/{epochs} train batch {batch_idx}")
@@ -295,7 +296,7 @@ def main():
             write_status(mode, f"epoch {epoch}/{epochs} val start")
             train_stats = train_meters.summarize()
             val_stats = evaluate(
-                model, val_loader, criterion, device, track_derived_coarse, table, groups
+                model, val_loader, criterion, device, track_derived_coarse, table, group_index
             )
             print(format_epoch(epoch, epochs, train_stats, val_stats, current_lr, mode), flush=True)
             log_metrics(

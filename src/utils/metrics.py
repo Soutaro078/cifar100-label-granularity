@@ -35,17 +35,29 @@ def build_fine_to_coarse(split_dict: dict) -> tuple[torch.Tensor, list[torch.Ten
 
 
 def move_fine_to_coarse(table: torch.Tensor, groups: list[torch.Tensor], device: torch.device):
+    """対応表を device へ移し、coarse ごとの fine 番号を [20, 5] にまとめる。
+
+    学習中に torch.stack へテンソルのリストを渡さない。その呼び出しが
+    PyTorch の IListRef 内部アサートで落ちていた。
+    """
     table = table.to(device)
-    groups = [group.to(device) for group in groups]
-    return table, groups
+    group_index = torch.stack([group.to(device) for group in groups], dim=0)
+    if group_index.shape != (20, 5):
+        raise ValueError(f"coarse ごとの fine 番号は [20, 5] である必要があります: {tuple(group_index.shape)}")
+    return table, group_index
 
 
-def coarse_logits_from_fine(logits: torch.Tensor, groups: list[torch.Tensor]) -> torch.Tensor:
-    """100 クラスの logit を、同じ coarse に属する 5 クラスごとに logsumexp して 20 クラスにする。"""
-    return torch.stack(
-        [torch.logsumexp(logits.index_select(1, indices), dim=1) for indices in groups],
-        dim=1,
-    )
+def coarse_logits_from_fine(logits: torch.Tensor, group_index: torch.Tensor) -> torch.Tensor:
+    """100 クラスの logit を、同じ coarse に属する 5 クラスごとに logsumexp して 20 クラスにする。
+
+    logits: [batch, 100]
+    group_index: [20, 5]
+    戻り値: [batch, 20]
+    """
+    flat_index = group_index.reshape(-1)
+    selected = logits.index_select(1, flat_index)
+    selected = selected.reshape(logits.shape[0], group_index.shape[0], group_index.shape[1])
+    return torch.logsumexp(selected, dim=-1)
 
 
 class GranularityMeters:
@@ -65,7 +77,7 @@ class GranularityMeters:
         labels: torch.Tensor,
         criterion: nn.Module,
         table: torch.Tensor | None = None,
-        groups: list[torch.Tensor] | None = None,
+        group_index: torch.Tensor | None = None,
     ) -> None:
         loss = criterion(outputs, labels)
         predicted = outputs.argmax(dim=1)
@@ -76,12 +88,12 @@ class GranularityMeters:
 
         if not self.track_derived_coarse:
             return
-        if table is None or groups is None:
+        if table is None or group_index is None:
             raise ValueError("Fine モデルの Coarse 指標には fine→coarse 対応表が必要です")
 
         coarse_labels = table[labels]
         coarse_predicted = table[predicted]
-        coarse_logits = coarse_logits_from_fine(outputs, groups)
+        coarse_logits = coarse_logits_from_fine(outputs, group_index)
         coarse_loss = criterion(coarse_logits, coarse_labels)
         self.coarse_loss_sum += coarse_loss.detach().item() * batch_size
         self.coarse_correct += coarse_predicted.eq(coarse_labels).sum().item()

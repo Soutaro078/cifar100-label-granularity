@@ -10,3 +10,7 @@ outputs/models/*.pt
 outputs/figures/*.png
 
 wandb/
+
+.cursor/
+*.log
+outputs/models/*.status.txt

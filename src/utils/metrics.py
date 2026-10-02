@@ -78,11 +78,19 @@ class GranularityMeters:
         criterion: nn.Module,
         table: torch.Tensor | None = None,
         group_index: torch.Tensor | None = None,
+        task_loss: torch.Tensor | None = None,
     ) -> None:
-        loss = criterion(outputs, labels)
+        # backward 済みのテンソルに CrossEntropy をかけ直すと、
+        # 一部の CUDA / PyTorch の組み合わせでプロセスが落ちる。
+        outputs = outputs.detach().cpu()
+        labels = labels.detach().cpu()
+        if task_loss is None:
+            loss_value = criterion(outputs, labels).item()
+        else:
+            loss_value = float(task_loss.detach().item())
         predicted = outputs.argmax(dim=1)
         batch_size = labels.size(0)
-        self.loss_sum += loss.detach().item() * batch_size
+        self.loss_sum += loss_value * batch_size
         self.correct += predicted.eq(labels).sum().item()
         self.total += batch_size
 
@@ -91,11 +99,13 @@ class GranularityMeters:
         if table is None or group_index is None:
             raise ValueError("Fine モデルの Coarse 指標には fine→coarse 対応表が必要です")
 
+        table = table.detach().cpu()
+        group_index = group_index.detach().cpu()
         coarse_labels = table[labels]
         coarse_predicted = table[predicted]
         coarse_logits = coarse_logits_from_fine(outputs, group_index)
         coarse_loss = criterion(coarse_logits, coarse_labels)
-        self.coarse_loss_sum += coarse_loss.detach().item() * batch_size
+        self.coarse_loss_sum += coarse_loss.item() * batch_size
         self.coarse_correct += coarse_predicted.eq(coarse_labels).sum().item()
 
     def summarize(self) -> dict:

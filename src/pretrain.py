@@ -1,4 +1,10 @@
 import argparse
+import os
+
+# Anaconda の MKL / OpenMP と PyTorch が衝突すると、学習中に
+# Segmentation fault で落ちることがある。torch を読む前に固定する。
+os.environ.setdefault("MKL_THREADING_LAYER", "GNU")
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 import torch
 import torch.nn as nn
@@ -101,19 +107,42 @@ def write_status(mode: str, message: str) -> None:
     path.write_text(message + "\n", encoding="utf-8")
 
 
+def _synchronize(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+
+
+def _to_cpu(obj):
+    if torch.is_tensor(obj):
+        return obj.detach().cpu()
+    if isinstance(obj, dict):
+        return {key: _to_cpu(value) for key, value in obj.items()}
+    if isinstance(obj, list):
+        return [_to_cpu(value) for value in obj]
+    return obj
+
+
+def _atomic_torch_save(obj, path) -> None:
+    """途中で落ちても 0 バイトの本番ファイルを残さない。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(path.name + ".tmp")
+    torch.save(obj, tmp_path)
+    os.replace(tmp_path, path)
+
+
 def save_progress(mode, epoch, model, optimizer, scheduler) -> None:
     """完了したエポックの重みと、再開用の最適化状態を残す。"""
     weights_path = pretrain_checkpoint_path(mode)
     resume_path = pretrain_resume_path(mode)
     weights_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(model.state_dict(), weights_path)
-    torch.save(
+    _atomic_torch_save(_to_cpu(model.state_dict()), weights_path)
+    _atomic_torch_save(
         {
             "epoch": epoch,
             "mode": mode,
-            "model": model.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "scheduler": scheduler.state_dict(),
+            "model": _to_cpu(model.state_dict()),
+            "optimizer": _to_cpu(optimizer.state_dict()),
+            "scheduler": _to_cpu(scheduler.state_dict()),
         },
         resume_path,
     )
@@ -121,8 +150,10 @@ def save_progress(mode, epoch, model, optimizer, scheduler) -> None:
 
 def load_progress(mode, model, optimizer, scheduler, device):
     resume_path = pretrain_resume_path(mode)
-    if not resume_path.is_file():
-        raise FileNotFoundError(f"再開用ファイルがありません: {resume_path}")
+    if not resume_path.is_file() or resume_path.stat().st_size == 0:
+        raise FileNotFoundError(
+            f"再開用ファイルがありません（空ファイルも含む）: {resume_path}"
+        )
     checkpoint = torch.load(resume_path, map_location=device, weights_only=False)
     if checkpoint.get("mode") != mode:
         raise ValueError(
@@ -213,6 +244,8 @@ def main():
 
     model = build_cifar_resnet18(num_classes)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = False
     model = model.to(device)
     table, group_index = move_fine_to_coarse(table, groups, device)
     print(f"使用デバイス: {device}")
@@ -281,15 +314,22 @@ def main():
                 optimizer.zero_grad()
                 outputs = model(images)
                 loss = criterion(outputs, labels)
+                train_meters.update(
+                    outputs,
+                    labels,
+                    criterion,
+                    table,
+                    group_index,
+                    task_loss=loss,
+                )
                 loss.backward()
                 optimizer.step()
 
-                with torch.no_grad():
-                    train_meters.update(outputs, labels, criterion, table, group_index)
-
                 if batch_idx % 50 == 0:
+                    _synchronize(device)
                     write_status(mode, f"epoch {epoch}/{epochs} train batch {batch_idx}")
 
+            _synchronize(device)
             current_lr = optimizer.param_groups[0]["lr"]
             scheduler.step()
 
@@ -298,6 +338,7 @@ def main():
             val_stats = evaluate(
                 model, val_loader, criterion, device, track_derived_coarse, table, group_index
             )
+            _synchronize(device)
             print(format_epoch(epoch, epochs, train_stats, val_stats, current_lr, mode), flush=True)
             log_metrics(
                 run,

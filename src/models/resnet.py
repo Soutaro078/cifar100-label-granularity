@@ -20,6 +20,11 @@ def build_cifar_resnet18(num_classes: int) -> nn.Module:
     model.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
     model.maxpool = nn.Identity()
     model.fc = nn.Linear(model.fc.in_features, num_classes)
+    # torchvision の ReLU は inplace=True。学習中に出力を集計すると
+    # CUDA illegal memory access になることがある。
+    for module in model.modules():
+        if isinstance(module, nn.ReLU):
+            module.inplace = False
     assert_cifar32_stem(model)
     return model
 

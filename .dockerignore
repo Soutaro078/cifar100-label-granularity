@@ -1,0 +1,10 @@
+.git
+.cursor
+**/__pycache__
+**/*.pyc
+data
+outputs
+wandb
+*.log
+*.pth
+*.pt

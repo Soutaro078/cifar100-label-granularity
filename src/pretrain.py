@@ -1,10 +1,10 @@
 import argparse
 import os
 
-# Anaconda の MKL / OpenMP と PyTorch が衝突すると、学習中に
-# Segmentation fault で落ちることがある。torch を読む前に固定する。
+# Anaconda の MKL が Intel OpenMP を読み、PyTorch の GNU OpenMP と二重になる。
+# torch を import する前に GNU へ固定する。KMP_DUPLICATE_LIB_OK は二重ロードを
+# 黙認するだけなので、ここでは設定しない。
 os.environ.setdefault("MKL_THREADING_LAYER", "GNU")
-os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 import torch
 import torch.nn as nn
@@ -15,12 +15,7 @@ from torch.utils.data import DataLoader
 from models.resnet import build_cifar_resnet18
 from utils.cifar import load_split_dict
 from utils.config import apply_overrides, load_yaml
-from utils.metrics import (
-    GranularityMeters,
-    build_fine_to_coarse,
-    move_fine_to_coarse,
-    pretrain_wandb_metrics,
-)
+from utils.metrics import GranularityMeters, pretrain_wandb_metrics
 from utils.paths import (
     CONFIGS_DIR,
     DATA_ROOT,
@@ -165,31 +160,37 @@ def load_progress(mode, model, optimizer, scheduler, device):
     return int(checkpoint["epoch"])
 
 
-def evaluate(model, loader, criterion, device, track_derived_coarse, table, group_index):
+def task_counts(outputs: torch.Tensor, labels: torch.Tensor, loss: torch.Tensor) -> tuple[float, int, int]:
+    """勾配を切ったあと、損失のスカラーと正解数だけを返す。
+
+    ロジット全体は CPU へ移さない。argmax と .item() だけを使う。
+    """
+    with torch.no_grad():
+        batch_size = int(labels.shape[0])
+        correct = int(outputs.argmax(dim=1).eq(labels).sum().item())
+        loss_value = float(loss.detach().item())
+    return loss_value, correct, batch_size
+
+
+def evaluate(model, loader, criterion, device):
     model.eval()
-    meters = GranularityMeters(track_derived_coarse)
+    meters = GranularityMeters()
     with torch.no_grad():
         for images, labels in loader:
             images = images.to(device)
             labels = labels.to(device)
             outputs = model(images)
-            meters.update(outputs, labels, criterion, table, group_index)
+            loss = criterion(outputs, labels)
+            meters.update(*task_counts(outputs, labels, loss))
     return meters.summarize()
 
 
 def format_epoch(epoch, epochs, train, val, lr, mode) -> str:
-    if mode == "fine":
-        return (
-            f"Epoch [{epoch}/{epochs}] | "
-            f"Train Loss: {train['loss']:.4f} | Train Fine Acc: {train['accuracy']:.2f}% | "
-            f"Train Coarse Acc: {train['coarse_accuracy']:.2f}% | "
-            f"Val Loss: {val['loss']:.4f} | Val Fine Acc: {val['accuracy']:.2f}% | "
-            f"Val Coarse Acc: {val['coarse_accuracy']:.2f}% | LR: {lr:.6f}"
-        )
+    label = "Fine" if mode == "fine" else "Coarse"
     return (
         f"Epoch [{epoch}/{epochs}] | "
-        f"Train Loss: {train['loss']:.4f} | Train Coarse Acc: {train['accuracy']:.2f}% | "
-        f"Val Loss: {val['loss']:.4f} | Val Coarse Acc: {val['accuracy']:.2f}% | LR: {lr:.6f}"
+        f"Train Loss: {train['loss']:.4f} | Train {label} Acc: {train['accuracy']:.2f}% | "
+        f"Val Loss: {val['loss']:.4f} | Val {label} Acc: {val['accuracy']:.2f}% | LR: {lr:.6f}"
     )
 
 
@@ -200,7 +201,6 @@ def main():
     epochs = int(cfg["epochs"])
     batch_size = int(cfg["batch_size"])
     lr = float(cfg["lr"])
-    track_derived_coarse = mode == "fine"
     num_classes = 100 if mode == "fine" else 20
 
     print(f"=== CIFAR-100 事前学習開始 (モード: {mode.upper()}, {num_classes}クラス) ===")
@@ -213,10 +213,10 @@ def main():
         "augmentation=RandomCrop(32, padding=4)+RandomHorizontalFlip"
     )
     print("検証: CIFAR-100 の test split を val として毎エポック評価します。早期終了には使いません。")
-    if track_derived_coarse:
-        print("Fine 学習中は、予測クラスを公式の coarse 対応へ写して Coarse の Loss / Accuracy も記録します。")
-    else:
-        print("Coarse 学習の出力は 20 クラスのため、記録する評価は Coarse の Loss / Accuracy です。")
+    print(
+        f"記録するのは {num_classes} クラスの交差エントロピーと正解率だけです。"
+        "Fine 予測を 20 クラスへ写す計算はしません。"
+    )
 
     trainset = torchvision.datasets.CIFAR100(
         root=str(DATA_ROOT),
@@ -231,10 +231,8 @@ def main():
         transform=cifar100_eval_transform(),
     )
 
-    train_dict = load_split_dict("train")
-    table, groups = build_fine_to_coarse(train_dict)
     if mode == "coarse":
-        trainset.targets = train_dict["coarse_labels"]
+        trainset.targets = load_split_dict("train")["coarse_labels"]
         valset.targets = load_split_dict("test")["coarse_labels"]
 
     num_workers = int(cfg["num_workers"])
@@ -247,7 +245,6 @@ def main():
     if device.type == "cuda":
         torch.backends.cudnn.benchmark = False
     model = model.to(device)
-    table, group_index = move_fine_to_coarse(table, groups, device)
     print(f"使用デバイス: {device}")
     print("stem: conv1 kernel=3 stride=1 padding=1, maxpool=Identity (32×32 用)")
 
@@ -286,6 +283,7 @@ def main():
             "num_classes": num_classes,
             "augmentation": "RandomCrop(32, padding=4)+RandomHorizontalFlip",
             "val_split": "cifar100_test",
+            "derived_coarse_metrics": False,
             "device": str(device),
         },
     )
@@ -306,38 +304,30 @@ def main():
             print(f"Epoch [{epoch}/{epochs}] を開始します。", flush=True)
             write_status(mode, f"epoch {epoch}/{epochs} train start")
             model.train()
-            train_meters = GranularityMeters(track_derived_coarse)
+            train_meters = GranularityMeters()
             for batch_idx, (images, labels) in enumerate(train_loader):
                 images = images.to(device)
                 labels = labels.to(device)
 
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
                 outputs = model(images)
                 loss = criterion(outputs, labels)
-                train_meters.update(
-                    outputs,
-                    labels,
-                    criterion,
-                    table,
-                    group_index,
-                    task_loss=loss,
-                )
                 loss.backward()
                 optimizer.step()
+                # backward がグラフを解放したあとで、Python の数値だけを残す。
+                train_meters.update(*task_counts(outputs, labels, loss))
 
                 if batch_idx % 50 == 0:
-                    _synchronize(device)
                     write_status(mode, f"epoch {epoch}/{epochs} train batch {batch_idx}")
 
             _synchronize(device)
-            current_lr = optimizer.param_groups[0]["lr"]
+            # このエポックで使った学習率。scheduler はエポックに 1 回だけ進める。
+            current_lr = float(optimizer.param_groups[0]["lr"])
             scheduler.step()
 
             write_status(mode, f"epoch {epoch}/{epochs} val start")
             train_stats = train_meters.summarize()
-            val_stats = evaluate(
-                model, val_loader, criterion, device, track_derived_coarse, table, group_index
-            )
+            val_stats = evaluate(model, val_loader, criterion, device)
             _synchronize(device)
             print(format_epoch(epoch, epochs, train_stats, val_stats, current_lr, mode), flush=True)
             log_metrics(

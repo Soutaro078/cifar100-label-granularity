@@ -1,0 +1,16 @@
+services:
+  app:
+    build: .
+    image: cifar100-label-granularity:cu124
+    working_dir: /workspace
+    shm_size: 8gb
+    gpus: all
+    environment:
+      MPLBACKEND: Agg
+      MKL_THREADING_LAYER: GNU
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - ./src:/workspace/src
+      - ./outputs:/workspace/outputs
+      - ./data:/workspace/data
+      - ./configs:/workspace/configs
